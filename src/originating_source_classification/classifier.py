@@ -4,6 +4,7 @@ Workbook: src/originating_source_classification/ApplicationCatalog.xlsx
 Outputs structured JSON for all applications
 """
 
+import re
 import asyncio
 import contextlib
 import signal
@@ -192,6 +193,21 @@ classification_agent = agents.Agent(
     model=agents.OpenAIChatCompletionsModel(model=AGENT_LLM_NAME, openai_client=async_openai_client)
 )
 
+
+def clean_model_json(text: str) -> str:
+    # Remove Python-style escaping of single quotes: \' -> '
+    text = text.replace("\\'", "'")
+
+    # Remove Tab escapes like \t inside reasoning (if any)
+    # You can keep \n because valid JSON strings allow them only if escaped \\n
+    # but Gemini sometimes outputs raw control chars.
+    text = text.replace("\t", " ")
+
+    # Fix stray backslashes before non-JSON escape characters
+    text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+
+    return text
+
 # ---------- Batch classification with gold label check ----------
 async def classify_all_applications(business_line: str):
     results = []
@@ -199,6 +215,8 @@ async def classify_all_applications(business_line: str):
     setup_langfuse_tracer()
     with langfuse_client.start_as_current_span(name="Batch-Originating-Source") as span:
         for app in apps_index.values():
+            if not (business_line in app['business_line']):
+                continue
             query = f"Is {app['app_id']} an originating source for '{business_line}'"
             span.update(input=query)
 
@@ -215,7 +233,7 @@ async def classify_all_applications(business_line: str):
                 json_text = full_content[start_idx + 7:end_idx].strip()
             else:
                 json_text = full_content
-
+            json_text = clean_model_json(json_text)
             # Safe parsing
             try:
                 parsed = json.loads(json_text)
@@ -244,10 +262,37 @@ async def classify_all_applications(business_line: str):
                 "Gold Label": gold_label,
                 "Correct": correct
             })
-
         span.update(output=f"{len(results)} applications classified")
 
     df = pd.DataFrame(results)
+
+    # ---------- Classification Report ----------
+    # Convert enums to raw string values
+    df["Answer"] = df["Answer"].astype(str)
+    df["Gold Label"] = df["Gold Label"].astype(str)
+
+    # Compute confusion matrix values
+    labels = ["Yes", "No", "Maybe"]
+    report_rows = []
+    for pred in labels:
+        row = {"Predicted": pred}
+        for gold in labels:
+            count = df[(df["Answer"] == pred) & (df["Gold Label"] == gold)].shape[0]
+            row[gold] = count
+        report_rows.append(row)
+
+    report_df = pd.DataFrame(report_rows)
+
+    # Add totals
+    report_df["Total Predicted"] = report_df[labels].sum(axis=1)
+    gold_totals = df["Gold Label"].value_counts().reindex(labels, fill_value=0)
+    report_df.loc[len(report_df)] = (
+        ["Total Actual"] + gold_totals.tolist() + [gold_totals.sum()]
+    )
+
+    print("\n=== Classification Report ===")
+    print(report_df.to_string(index=False))
+    
     df.to_excel(OUTPUT_EXCEL_PATH, index=False)
 
     # Optionally print summary accuracy
